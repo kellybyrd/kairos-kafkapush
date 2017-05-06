@@ -1,9 +1,12 @@
 package org.kairosdb.plugin.kafkapush;
 
-import com.google.inject.Inject;
+import com.google.common.collect.ImmutableMap;
 
+import com.google.inject.Inject;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.math.NumberUtils;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.json.JSONWriter;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -13,47 +16,52 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.StringWriter;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.SortedMap;
+import java.util.regex.Pattern;
 
 import static com.google.common.base.Preconditions.checkArgument;
+
+
 
 public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointListener
 {
     public static final Logger logger = LoggerFactory.getLogger(KafkaPushDataPointListener.class);
+    private static final Map<String, String> REPLACE_CHAR_MAP = ImmutableMap.of(
+            "dash",       "-",
+            "dot",        ".",
+            "underscore", "_"
+    );
+
+    private static final Pattern VAILD_TOPIC_REGEX = Pattern.compile("[^a-zA-Z0-9-]");
+
 
     private Producer<String, String> kafkaClient;
-    private String kafkaTopic;
+    private String kafkaDefaultTopic;
+    private Optional<String> kafkaTopicTag;
+    private String kafkaTopicReplaceChar;
 
     @Inject
-    public KafkaPushDataPointListener(Properties kairos_props)
+    public KafkaPushDataPointListener(Properties props) throws IllegalArgumentException
     {
-        Properties props = new Properties();
+        this(props, configureKafkaProducer(props));
+    }
 
-        // Required properties
-        String kafkaServer = kairos_props.getProperty("kairosdb.kafkapush.server", "");
-        short kafkaPort = NumberUtils.toShort(kairos_props.getProperty("kairosdb.kafkapush.port"),NumberUtils.SHORT_ZERO);
-        kafkaTopic = kairos_props.getProperty("kairosdb.kafkapush.topic", "");
-
-        checkArgument(StringUtils.isNotBlank(kafkaServer), "Kafka server name must not be blank");
-        checkArgument(kafkaPort > 0, "Kafka port number must be > 0 ");
-        checkArgument(StringUtils.isNotBlank(kafkaTopic), "Kafka topic must not be blank");
-
-        props.put("bootstrap.servers", kafkaServer + ':' + Integer.toString(kafkaPort));
+    public KafkaPushDataPointListener(Properties props, Producer kafkaClient) throws IllegalArgumentException
+    {
+        this.kafkaClient = kafkaClient;
+        // topic.default is required
+        kafkaDefaultTopic = StringUtils.trimToEmpty(props.getProperty("kairosdb.kafkapush.topic.default", ""));
+        checkArgument(StringUtils.isNotBlank(kafkaDefaultTopic));
 
         // Properties with defaults
-        props.put("acks",                             kairos_props.getProperty("kairosdb.kafkapush.acks",          "all"));
-        props.put("retries",        NumberUtils.toInt(kairos_props.getProperty("kairosdb.kafkapush.retries"),       0));
-        props.put("linger.ms",      NumberUtils.toInt(kairos_props.getProperty("kairosdb.kafkapush.linger"),        1));
-        props.put("batch.size",     NumberUtils.toInt(kairos_props.getProperty("kairosdb.kafkapush.batch_size"),    16384));
-        props.put("buffer.memory",  NumberUtils.toInt(kairos_props.getProperty("kairosdb.kafkapush.buffer_memory"), 3554432));
+        kafkaTopicTag = Optional.ofNullable(props.getProperty("kairosdb.kafkapush.topic.tag", ""));
+        kafkaTopicReplaceChar =
+                REPLACE_CHAR_MAP.getOrDefault(StringUtils.trimToEmpty(
+                        props.getProperty("kairosdb.kafkapush.topic.replacechar")),"_");
 
-        // Not-user settable
-        props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-        props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
-        
-        kafkaClient = new KafkaProducer<>(props);
-        logger.debug("Created KafkaPush DataListener with kafka bootstrap.server {}:{}", kafkaServer, kafkaPort);
     }
 
     @Override
@@ -75,7 +83,15 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
             jsonWriter.endArray();
             jsonWriter.endObject();
 
-            kafkaClient.send(new ProducerRecord<>(kafkaTopic, metricName, stringWriter.toString()));
+            Optional<String> curTopic = getKafkaTopicName(tags);
+
+            if (curTopic.isPresent()) {
+                kafkaClient.send(new ProducerRecord<>(curTopic.get(), metricName, stringWriter.toString()));
+            } else {
+                // We should never see this because the constructor should enforce a default topic
+                // being set.
+                logger.error("Could not produce valid kafka topic, not sending datapoint.");
+            }
         }
         catch (Exception e) {
             logger.error("Error assembling JSON for output to Kafka: {}", e.getMessage());
@@ -84,6 +100,58 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
             logger.error("Stacktrace: {}", e.getStackTrace().toString());
         }
 
+    }
+
+    public String getKafkaDefaultTopic() {
+        return kafkaDefaultTopic;
+    }
+
+    public String getKafkaTopicReplaceChar() {
+        return kafkaTopicReplaceChar;
+    }
+
+    public Optional<String> getKafkaTopicTag() {
+        return kafkaTopicTag;
+    }
+
+    /*
+     * Given a DataPoint, return the correct topic. Right now the logic is:
+     * - If 'kairosdb.kafkapush.topic.tag' is not blank and that tag exists in current
+     *      datapoint, use the value of that tag.
+     * - Otherwise use the value of kairosdb.kafkapush.topic.default
+     *
+     * NOTES:
+     * - This function will normalize whatever result it gets to produce a valid Kafka
+     *   topic name. If the normalized result is blank, it will return Optional.empty.
+     */
+    private Optional<String> getKafkaTopicName(final SortedMap<String, String> tags)
+    {
+        return kafkaTopicTag.map(s -> {
+            String topic = StringUtils.trimToEmpty(
+                    StringUtils.defaultIfBlank(tags.get(s), kafkaDefaultTopic));
+            return VAILD_TOPIC_REGEX.matcher(topic).replaceAll(kafkaTopicReplaceChar);
+        }).filter(StringUtils::isNotBlank);
+    }
+
+    static private Producer configureKafkaProducer(Properties kairosProps) throws IllegalArgumentException
+    {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", kairosProps.getProperty("kairosdb.kafkapush.servers", ""));
+
+        props.put("acks", kairosProps.getProperty("kairosdb.kafkapush.acks", "all"));
+        props.put("retries", NumberUtils.toInt(kairosProps.getProperty("kairosdb.kafkapush.retries"), 0));
+        props.put("linger.ms", NumberUtils.toInt(kairosProps.getProperty("kairosdb.kafkapush.linger"), 1));
+        props.put("batch.size", NumberUtils.toInt(kairosProps.getProperty("kairosdb.kafkapush.batch_size"), 16384));
+        props.put("buffer.memory", NumberUtils.toInt(kairosProps.getProperty("kairosdb.kafkapush.buffer_memory"), 3554432));
+
+        try {
+            logger.debug("Creating KafkaProducer with kafka bootstrap.servers: ",  props.getProperty("bootstrap.servers"));
+            return new KafkaProducer<>(props, new StringSerializer(), new StringSerializer());
+        }
+        catch (KafkaException ke) {
+            logger.error("Couldn't configure KafkaProducer: {}", ke);
+            throw new IllegalArgumentException(ke);
+        }
     }
 }
 
