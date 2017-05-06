@@ -61,7 +61,7 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
         kafkaTopicReplaceChar =
                 REPLACE_CHAR_MAP.getOrDefault(StringUtils.trimToEmpty(
                         props.getProperty("kairosdb.kafkapush.topic.replacechar")),"_");
-
+        logger.info("Created datapoint listener.");
     }
 
     @Override
@@ -145,7 +145,6 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
         props.put("buffer.memory", NumberUtils.toInt(kairosProps.getProperty("kairosdb.kafkapush.buffer_memory"), 3554432));
 
         try {
-            logger.debug("Creating KafkaProducer with kafka bootstrap.servers: ",  props.getProperty("bootstrap.servers"));
             return new KafkaProducer<>(props, new StringSerializer(), new StringSerializer());
         }
         catch (KafkaException ke) {
