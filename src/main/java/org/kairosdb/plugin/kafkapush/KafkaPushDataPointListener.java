@@ -7,6 +7,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.math.NumberUtils;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.json.JSONException;
 import org.json.JSONWriter;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -23,7 +24,6 @@ import java.util.SortedMap;
 import java.util.regex.Pattern;
 
 import static com.google.common.base.Preconditions.checkArgument;
-
 
 
 public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointListener
@@ -67,39 +67,16 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
     @Override
     public void dataPoint(String metricName, SortedMap<String, String> tags, DataPoint dataPoint)
     {
-        StringWriter stringWriter = new StringWriter();
-        JSONWriter jsonWriter = new JSONWriter(stringWriter);
-        try {
-
-            jsonWriter.object();
-            jsonWriter.key("name").value(metricName);
-            jsonWriter.key("tags").value(tags);
-            jsonWriter.key("datapoints").array();
-
-            jsonWriter.array().value(dataPoint.getTimestamp());
-            dataPoint.writeValueToJson(jsonWriter);
-            jsonWriter.value(dataPoint.getApiDataType()).endArray();
-
-            jsonWriter.endArray();
-            jsonWriter.endObject();
-
-            Optional<String> curTopic = getKafkaTopicName(tags);
-
-            if (curTopic.isPresent()) {
-                kafkaClient.send(new ProducerRecord<>(curTopic.get(), metricName, stringWriter.toString()));
-            } else {
-                // We should never see this because the constructor should enforce a default topic
-                // being set.
-                logger.error("Could not produce valid kafka topic, not sending datapoint.");
-            }
+        Optional<String> curTopic = getKafkaTopicName(tags);
+        if (curTopic.isPresent()) {
+            makeJsonMessage(metricName, tags, dataPoint).ifPresent(
+                    json -> kafkaClient.send(new ProducerRecord<>(curTopic.get(), metricName,
+                            json)));
+        } else {
+            // We should never see this because the constructor should enforce a default topic
+            // being set.
+            logger.error("Could not produce valid kafka topic, not sending datapoint.");
         }
-        catch (Exception e) {
-            logger.error("Error assembling JSON for output to Kafka: {}", e.getMessage());
-            logger.error("DataPoint was: {}", dataPoint);
-            logger.error("JSON in progress was: {}", stringWriter.toString());
-            logger.error("Stacktrace: {}", e.getStackTrace().toString());
-        }
-
     }
 
     public String getKafkaDefaultTopic() {
@@ -112,6 +89,58 @@ public class KafkaPushDataPointListener implements org.kairosdb.core.DataPointLi
 
     public Optional<String> getKafkaTopicTag() {
         return kafkaTopicTag;
+    }
+
+    /*
+     * The JSON format is done for ease of ingestion into a Riemann system.
+     */
+    private Optional<String> makeJsonMessage(String metricName, SortedMap<String, String> tags,
+            DataPoint dataPoint)
+    {
+        Optional<String> ret = Optional.empty();
+
+        StringWriter stringWriter = new StringWriter();
+        JSONWriter jsonWriter = new JSONWriter(stringWriter);
+        try {
+            jsonWriter.object();
+            jsonWriter.key("service").value(metricName);
+
+            if (tags.containsKey("host")) {
+                jsonWriter.key("host").value(tags.get("host"));
+            }
+
+            jsonWriter.key("metric");
+            if (dataPoint.isLong()) {
+                jsonWriter.value(dataPoint.getLongValue());
+            }
+            else if (dataPoint.isDouble()) {
+                jsonWriter.value(dataPoint.getDoubleValue());
+            }
+            else {
+                //String or complex values can't be fit into "metric", they'll only show up in the
+                // "datapoint" attribute.
+                jsonWriter.value(null);
+            }
+
+            jsonWriter.key("datapoint").object();
+            jsonWriter.key("timestamp").value(dataPoint.getTimestamp());
+            jsonWriter.key("value");
+            dataPoint.writeValueToJson(jsonWriter);
+            jsonWriter.key("type").value(dataPoint.getApiDataType());
+            jsonWriter.endObject();
+
+            jsonWriter.key("kariosdb_tags").value(tags);
+            jsonWriter.endObject();
+
+            ret = Optional.of(stringWriter.toString());
+        } catch (JSONException e) {
+            logger.error("Error assembling JSON for output to Kafka: {}", e.getMessage());
+            logger.error("DataPoint was: {}", dataPoint);
+            logger.error("JSON in progress was: {}", stringWriter.toString());
+            logger.error("Stacktrace: {}", e.getStackTrace().toString());
+        }
+
+        return ret;
     }
 
     /*

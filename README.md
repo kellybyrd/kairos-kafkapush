@@ -11,28 +11,32 @@ Using the Kafka Plugin
 
 To use this:
 
-1. Build the jar with 'mvn package' 
+1. Build the jar with 'mvn package'
 1. Copy copy the jar and karios-kafkapush.properties files into /opt/kairosdb/lib and
 /opt/kairosdb/conf directories respectively.
-1. In the properties file, rdit at least kairosdb.kafkapush.server, kairosdb.kafkapush.port, and 
+1. In the properties file, rdit at least kairosdb.kafkapush.server, kairosdb.kafkapush.port, and
 kairosdb.kafkapush.topic properties for your local environment
 
 
 Using the Kafka Plugin
 ----------------------
 This initial version pushes KariosDB datapoints to Kafka with metric_name as the key, and then
-a JSON value in this form
+a JSON objecct as the value. The format is skewed for easy ingestion into Riemman.
 ```
 {
-  "name": "metric_name",
-  "tags": {
-            "foo": "bar",
-            "host":"machine.lan.net"
-          },
-  "datapoints":[ 
-                 [timestamp, value, type],
-                 [1493681535308, 42 ,"long"]
-               ]
+  "service": $METRIC NAME
+  "host": $HOST_TAG,                  // Only present if a host tag exists in the datapoint.
+  "metric": $DATAPOINT_VALUE          // If datapoint type is long or double, value goes here.
+                                      //    else 'null'
+  "datapoint":{
+        "timestamp": 1493681535308,
+        "value": 42,
+        "type": "long"
+  }
+  "kairosdb_tags": {
+        "foo": "bar",
+        "host":"machine.lan.net"
+  },
 }
 ```
 
